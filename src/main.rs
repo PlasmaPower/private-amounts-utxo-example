@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use bulletproofs::{BulletproofGens, PedersenGens};
 use ed25519_dalek::Keypair;
 use rand::thread_rng;
