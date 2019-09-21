@@ -62,7 +62,7 @@ pub struct PrivacyProofs {
 }
 
 /// Basic information that is hashed into the transaction.
-pub struct TransactionInner {
+pub struct TransactionBody {
     pub inputs: Vec<OutputRef>,
     pub outputs: Vec<Output>,
 }
@@ -76,7 +76,7 @@ struct TransactionTail {
 }
 
 pub struct Transaction {
-    inner: TransactionInner,
+    inner: TransactionBody,
     tail: TransactionTail,
 }
 
@@ -229,7 +229,7 @@ pub struct AbstractedOutput {
     pub private: bool,
 }
 
-impl TransactionInner {
+impl TransactionBody {
     pub fn hash(&self) -> Hash {
         let mut hasher = Sha256::default();
         assert!(
@@ -283,7 +283,7 @@ impl Transaction {
         &self.inner.outputs
     }
 
-    pub fn into_inner(self) -> TransactionInner {
+    pub fn into_inner(self) -> TransactionBody {
         self.inner
     }
 
@@ -558,7 +558,7 @@ impl Transaction {
         if running_amount != 0 {
             return Err(InvalidTransaction::MismatchedAmounts);
         }
-        let inner = TransactionInner {
+        let inner = TransactionBody {
             inputs,
             outputs: real_outputs,
         };
