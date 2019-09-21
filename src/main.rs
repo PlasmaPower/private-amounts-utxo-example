@@ -3,9 +3,11 @@ use ed25519_dalek::Keypair;
 use rand::thread_rng;
 use sha2::Sha512;
 
-mod chain;
+mod ledger;
+mod transaction;
 
-use crate::chain::{AbstractedOutput, ChainConstants, Ledger, Transaction};
+use crate::ledger::{ChainConstants, Ledger};
+use crate::transaction::{AbstractedOutput, Transaction};
 
 const DOMAIN_NAME: &[u8] = b"PlasmaPower/private-amounts-utxo-example";
 const PRIVATE_AMOUNT_BITS: usize = 64;

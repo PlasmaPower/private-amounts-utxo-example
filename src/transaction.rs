@@ -1,5 +1,4 @@
-use bulletproofs::BulletproofGens;
-use bulletproofs::PedersenGens;
+use crate::ledger::Ledger;
 use byteorder::{ByteOrder, LittleEndian};
 use curve25519_dalek::{
     edwards::CompressedEdwardsY,
@@ -11,22 +10,12 @@ use ed25519_dalek::{Keypair, PublicKey, SecretKey, Signature};
 use merlin::Transcript;
 use rand::RngCore;
 use sha2::{Digest, Sha256, Sha512};
-use std::{
-    collections::{HashMap, HashSet},
-    convert::TryFrom,
-};
+use std::{collections::HashSet, convert::TryFrom};
 use x25519_dalek as x25519;
 
 pub type Commitment = CompressedRistretto;
 pub type Hash = [u8; 32];
 pub type OutputRef = (Hash, u8);
-
-pub struct ChainConstants {
-    pub bp_gens: BulletproofGens,
-    pub pc_gens: PedersenGens,
-    pub private_amount_bits: usize,
-    pub domain_name: &'static [u8],
-}
 
 enum OutputAmount {
     Public(u64),
@@ -38,24 +27,25 @@ enum OutputAmount {
     },
 }
 
-struct Output {
-    destination: PublicKey,
+pub struct Output {
+    pub destination: PublicKey,
     amount: OutputAmount,
 }
 
-struct Utxo {
-    output: Output,
-    /// Used for the amount privacy key exchange.
-    /// See documentation on get_early_ref() for more details.
-    early_ref: Hash,
-    source_account: PublicKey,
-}
+impl Output {
+    pub(crate) fn create_genesis(destination: PublicKey) -> Output {
+        Output {
+            destination,
+            amount: OutputAmount::Public(u64::max_value()),
+        }
+    }
 
-pub struct Ledger {
-    consts: ChainConstants,
-
-    utxos: HashMap<(Hash, u8), Utxo>,
-    total_private_balance: u64,
+    pub fn get_public_amount(&self) -> Option<u64> {
+        match self.amount {
+            OutputAmount::Public(amount) => Some(amount),
+            OutputAmount::Private { .. } => None,
+        }
+    }
 }
 
 pub enum RangeProofWrapper {
@@ -72,9 +62,9 @@ pub struct PrivacyProofs {
 }
 
 /// Basic information that is hashed into the transaction.
-struct TransactionInner {
-    inputs: Vec<OutputRef>,
-    outputs: Vec<Output>,
+pub struct TransactionInner {
+    pub inputs: Vec<OutputRef>,
+    pub outputs: Vec<Output>,
 }
 
 /// Information that does not affect the nature of the transaction,
@@ -181,7 +171,7 @@ fn verify_ristretto_sig(
 /// the transaction's outputs are created. This is needed for the blinding
 /// key exchange to work (each blinding key should be unique, but they're
 /// needed to compute the outputs).
-fn get_early_ref(inputs: &[OutputRef], output_idx: u8) -> Hash {
+pub fn get_early_ref(inputs: &[OutputRef], output_idx: u8) -> Hash {
     let mut hasher = Sha256::default();
     assert!(inputs.len() <= u8::max_value().into(), "too many inputs",);
     hasher.input([inputs.len() as u8]);
@@ -240,7 +230,7 @@ pub struct AbstractedOutput {
 }
 
 impl TransactionInner {
-    fn hash(&self) -> Hash {
+    pub fn hash(&self) -> Hash {
         let mut hasher = Sha256::default();
         assert!(
             self.inputs.len() <= u8::max_value().into(),
@@ -280,6 +270,23 @@ impl Transaction {
         self.inner.hash()
     }
 
+    /// Warning: only guaranteed to be accurate if transaction is valid
+    pub fn uses_privacy(&self) -> bool {
+        self.tail.privacy_proofs.is_some()
+    }
+
+    pub fn get_inputs(&self) -> &[OutputRef] {
+        &self.inner.inputs
+    }
+
+    pub fn get_outputs(&self) -> &[Output] {
+        &self.inner.outputs
+    }
+
+    pub fn into_inner(self) -> TransactionInner {
+        self.inner
+    }
+
     pub fn validate(&self, ledger: &Ledger) -> Result<(), InvalidTransaction> {
         // This is an i128 because it needs to have the capacity of a u64 (not an i64),
         // but also be able to handle negatives. We could do a (u64, bool) but for for
@@ -298,7 +305,7 @@ impl Transaction {
                 // Let's not have another BTC incident ;)
                 return Err(InvalidTransaction::DuplicateInputs);
             }
-            if let Some(utxo) = ledger.utxos.get(input) {
+            if let Some(utxo) = ledger.get_utxo(input) {
                 if let Some(destination) = destination {
                     if utxo.output.destination != destination {
                         return Err(InvalidTransaction::MixedInputDestinations);
@@ -367,11 +374,11 @@ impl Transaction {
                     Some(RangeProofWrapper::Bulletproof(proof)) => {
                         proof
                             .verify_multiple(
-                                &ledger.consts.bp_gens,
-                                &ledger.consts.pc_gens,
-                                &mut Transcript::new(ledger.consts.domain_name),
+                                &ledger.consts().bp_gens,
+                                &ledger.consts().pc_gens,
+                                &mut Transcript::new(ledger.consts().domain_name),
                                 commitments_to_verify.as_slice(),
-                                ledger.consts.private_amount_bits,
+                                ledger.consts().private_amount_bits,
                             )
                             .map_err(InvalidTransaction::InvalidBulletproof)?;
                     }
@@ -394,9 +401,9 @@ impl Transaction {
             if total_public_negative {
                 total_public = -total_public;
             }
-            total_private += total_public * ledger.consts.pc_gens.B;
+            total_private += total_public * ledger.consts().pc_gens.B;
             verify_ristretto_sig(
-                &ledger.consts.pc_gens.B_blinding,
+                &ledger.consts().pc_gens.B_blinding,
                 &[],
                 &total_private,
                 &privacy_proofs.blinding_signature,
@@ -439,7 +446,7 @@ impl Transaction {
             if !seen_inputs.insert(input.clone()) {
                 return Err(InvalidTransaction::DuplicateInputs);
             }
-            if let Some(utxo) = ledger.utxos.get(input) {
+            if let Some(utxo) = ledger.get_utxo(input) {
                 if utxo.output.destination != public_key {
                     return Err(InvalidTransaction::InputHasDifferentOwner);
                 }
@@ -463,8 +470,8 @@ impl Transaction {
                         let amount_memo_mask = compute_amount_memo_mask(&blinding_secret);
                         let real_amount = amount_memo ^ amount_memo_mask;
                         let expected_commitment = Scalar::from(real_amount)
-                            * ledger.consts.pc_gens.B
-                            + blinding_secret * ledger.consts.pc_gens.B_blinding;
+                            * ledger.consts().pc_gens.B
+                            + blinding_secret * ledger.consts().pc_gens.B_blinding;
                         if commitment != expected_commitment.compress() {
                             return Err(InvalidTransaction::InvalidInputKeying);
                         }
@@ -509,12 +516,12 @@ impl Transaction {
                 pad_to_power_of_two(&mut range_proof_values);
                 pad_to_power_of_two(&mut range_proof_blindings);
                 let range_proof = bulletproofs::RangeProof::prove_multiple(
-                    &ledger.consts.bp_gens,
-                    &ledger.consts.pc_gens,
-                    &mut Transcript::new(ledger.consts.domain_name),
+                    &ledger.consts().bp_gens,
+                    &ledger.consts().pc_gens,
+                    &mut Transcript::new(ledger.consts().domain_name),
                     &range_proof_values,
                     &range_proof_blindings,
-                    ledger.consts.private_amount_bits,
+                    ledger.consts().private_amount_bits,
                 )
                 .expect("Bulletproof generation failed");
                 commitments = range_proof.1;
@@ -522,7 +529,7 @@ impl Transaction {
                 Some(range_proof.0)
             };
             let blinding_signature =
-                ristretto_sign(&ledger.consts.pc_gens.B_blinding, &[], &total_blindings);
+                ristretto_sign(&ledger.consts().pc_gens.B_blinding, &[], &total_blindings);
             privacy_proofs = Some(PrivacyProofs {
                 range_proof: range_proof.map(RangeProofWrapper::Bulletproof),
                 blinding_signature,
@@ -564,92 +571,6 @@ impl Transaction {
                 privacy_proofs,
             },
         })
-    }
-}
-
-impl Ledger {
-    pub fn new(consts: ChainConstants, genesis_acct: PublicKey) -> Ledger {
-        let mut utxos = HashMap::new();
-        utxos.insert(
-            ([0u8; 32], 0),
-            Utxo {
-                output: Output {
-                    destination: genesis_acct,
-                    amount: OutputAmount::Public(u64::max_value()),
-                },
-                early_ref: [0u8; 32],
-                source_account: PublicKey::default(),
-            },
-        );
-        Ledger {
-            consts,
-            utxos,
-            total_private_balance: 0,
-        }
-    }
-
-    pub fn process(&mut self, transaction: Transaction) -> Result<(), InvalidTransaction> {
-        transaction.validate(&self)?;
-        if transaction.tail.privacy_proofs.is_some() {
-            for input in &transaction.inner.inputs {
-                let utxo = self
-                    .utxos
-                    .get(input)
-                    .expect("Failed to get input from utxos for validated transaction");
-                if let OutputAmount::Public(amount) = utxo.output.amount {
-                    self.total_private_balance = self
-                        .total_private_balance
-                        .checked_add(amount)
-                        .expect(concat!(
-                            "Total private balance exceeded maximum u64 ",
-                            "(public transactions are broken?)"
-                        ));
-                }
-            }
-            for output in &transaction.inner.outputs {
-                if let OutputAmount::Public(amount) = output.amount {
-                    self.total_private_balance = self
-                        .total_private_balance
-                        .checked_sub(amount)
-                        .expect(concat!(
-                            "More balance extracted from privacy pool than ",
-                            "put in (privacy is broken!)"
-                        ));
-                }
-            }
-        }
-        let hash = transaction.hash();
-        let mut account = None;
-        for input in &transaction.inner.inputs {
-            let utxo = self
-                .utxos
-                .remove(input)
-                .expect("Validated transaction referenced non-existant UTXO");
-            if let Some(account) = account {
-                assert_eq!(account, utxo.output.destination);
-            } else {
-                account = Some(utxo.output.destination);
-            }
-        }
-        let account = account.expect("Account not set for validated transaction (no inputs?)");
-        assert!(
-            transaction.inner.outputs.len() <= u8::max_value().into(),
-            "too many outputs",
-        );
-        for (i, output) in transaction.inner.outputs.into_iter().enumerate() {
-            let i = i as u8;
-            let output_ref = (hash, i);
-            let early_ref = get_early_ref(&transaction.inner.inputs, i);
-            self.utxos.insert(
-                output_ref,
-                Utxo {
-                    output,
-                    early_ref,
-                    source_account: account,
-                },
-            );
-        }
-        Ok(())
     }
 }
 
