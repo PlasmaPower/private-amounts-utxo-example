@@ -305,32 +305,29 @@ impl Transaction {
                 // Let's not have another BTC incident ;)
                 return Err(InvalidTransaction::DuplicateInputs);
             }
-            if let Some(utxo) = ledger.get_utxo(input) {
-                if let Some(destination) = destination {
-                    if utxo.output.destination != destination {
-                        return Err(InvalidTransaction::MixedInputDestinations);
-                    }
-                } else {
-                    destination = Some(utxo.output.destination);
-                }
-                match utxo.output.amount {
-                    OutputAmount::Public(amount) => {
-                        total_public = total_public
-                            .checked_add(amount.into())
-                            .expect("Somehow managed to overflow public amount");
-                    }
-                    OutputAmount::Private { commitment, .. } => {
-                        // We don't need to verify the range proof, because we should've
-                        // done that when we added the output to the ChainState.
-                        let commitment = commitment
-                            .decompress()
-                            .ok_or(InvalidTransaction::InvalidCommitment)?;
-                        total_private += commitment;
-                        uses_privacy = true;
-                    }
+            let utxo = ledger.get_utxo(input).ok_or(InvalidTransaction::UnknownInput)?;
+            if let Some(destination) = destination {
+                if utxo.output.destination != destination {
+                    return Err(InvalidTransaction::MixedInputDestinations);
                 }
             } else {
-                return Err(InvalidTransaction::UnknownInput);
+                destination = Some(utxo.output.destination);
+            }
+            match utxo.output.amount {
+                OutputAmount::Public(amount) => {
+                    total_public = total_public
+                        .checked_add(amount.into())
+                        .expect("Somehow managed to overflow public amount");
+                }
+                OutputAmount::Private { commitment, .. } => {
+                    // We don't need to verify the range proof, because we should've
+                    // done that when we added the output to the ChainState.
+                    let commitment = commitment
+                        .decompress()
+                        .ok_or(InvalidTransaction::InvalidCommitment)?;
+                    total_private += commitment;
+                    uses_privacy = true;
+                }
             }
         }
         if self.inner.outputs.is_empty() || self.inner.outputs.len() > u8::max_value().into() {
@@ -446,43 +443,40 @@ impl Transaction {
             if !seen_inputs.insert(input.clone()) {
                 return Err(InvalidTransaction::DuplicateInputs);
             }
-            if let Some(utxo) = ledger.get_utxo(input) {
-                if utxo.output.destination != public_key {
-                    return Err(InvalidTransaction::InputHasDifferentOwner);
+            let utxo = ledger.get_utxo(input).ok_or(InvalidTransaction::UnknownInput)?;
+            if utxo.output.destination != public_key {
+                return Err(InvalidTransaction::InputHasDifferentOwner);
+            }
+            match utxo.output.amount {
+                OutputAmount::Public(amount) => {
+                    running_amount = running_amount
+                        .checked_add(amount)
+                        .expect("Running amount overflow in tx generation");
                 }
-                match utxo.output.amount {
-                    OutputAmount::Public(amount) => {
-                        running_amount = running_amount
-                            .checked_add(amount)
-                            .expect("Running amount overflow in tx generation");
+                OutputAmount::Private {
+                    amount_memo,
+                    commitment,
+                } => {
+                    uses_privacy = true;
+                    let blinding_secret = compute_blinding_secret(
+                        &keypair.secret,
+                        &utxo.source_account,
+                        utxo.early_ref,
+                    )
+                    .map_err(|_| InvalidTransaction::InvalidPrivateDestination)?;
+                    let amount_memo_mask = compute_amount_memo_mask(&blinding_secret);
+                    let real_amount = amount_memo ^ amount_memo_mask;
+                    let expected_commitment = Scalar::from(real_amount)
+                        * ledger.consts().pc_gens.B
+                        + blinding_secret * ledger.consts().pc_gens.B_blinding;
+                    if commitment != expected_commitment.compress() {
+                        return Err(InvalidTransaction::InvalidInputKeying);
                     }
-                    OutputAmount::Private {
-                        amount_memo,
-                        commitment,
-                    } => {
-                        uses_privacy = true;
-                        let blinding_secret = compute_blinding_secret(
-                            &keypair.secret,
-                            &utxo.source_account,
-                            utxo.early_ref,
-                        )
-                        .map_err(|_| InvalidTransaction::InvalidPrivateDestination)?;
-                        let amount_memo_mask = compute_amount_memo_mask(&blinding_secret);
-                        let real_amount = amount_memo ^ amount_memo_mask;
-                        let expected_commitment = Scalar::from(real_amount)
-                            * ledger.consts().pc_gens.B
-                            + blinding_secret * ledger.consts().pc_gens.B_blinding;
-                        if commitment != expected_commitment.compress() {
-                            return Err(InvalidTransaction::InvalidInputKeying);
-                        }
-                        running_amount = running_amount
-                            .checked_add(real_amount)
-                            .expect("Running amount overflow in tx generation");
-                        total_blindings += blinding_secret;
-                    }
+                    running_amount = running_amount
+                        .checked_add(real_amount)
+                        .expect("Running amount overflow in tx generation");
+                    total_blindings += blinding_secret;
                 }
-            } else {
-                return Err(InvalidTransaction::UnknownInput);
             }
         }
         if abstracted_outputs.is_empty() || abstracted_outputs.len() > u8::max_value().into() {
